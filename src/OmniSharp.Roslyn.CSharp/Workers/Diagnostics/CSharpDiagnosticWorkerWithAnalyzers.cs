@@ -215,14 +215,8 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
         public async Task<IEnumerable<Diagnostic>> AnalyzeDocumentAsync(Document document, CancellationToken cancellationToken)
         {
             Project project = document.Project;
-            var allAnalyzers = _providers
-                .SelectMany(x => x.CodeDiagnosticAnalyzerProviders)
-                .Concat(project.AnalyzerReferences.SelectMany(x => x.GetAnalyzers(project.Language)))
-                .ToImmutableArray();
 
-            var compilation = await project.GetCompilationAsync();
-            var workspaceAnalyzerOptions = (AnalyzerOptions)_workspaceAnalyzerOptionsConstructor.Invoke(new object[] { project.AnalyzerOptions, project.Solution });
-            var compilationWithAnalyzers = GetCompliationWtihAnalyzers(allAnalyzers, compilation, workspaceAnalyzerOptions);
+            var compilationWithAnalyzers = await GetCompilationWithAnalyzers(project);
 
             cancellationToken.ThrowIfCancellationRequested();
             return await AnalyzeDocument(project, compilationWithAnalyzers, document);
@@ -231,14 +225,8 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
         public async Task<IEnumerable<Diagnostic>> AnalyzeProjectsAsync(Project project, CancellationToken cancellationToken)
         {
             var diagnostics = new List<Diagnostic>();
-            var allAnalyzers = _providers
-                .SelectMany(x => x.CodeDiagnosticAnalyzerProviders)
-                .Concat(project.AnalyzerReferences.SelectMany(x => x.GetAnalyzers(project.Language)))
-                .ToImmutableArray();
 
-            var compilation = await project.GetCompilationAsync();
-            var workspaceAnalyzerOptions = (AnalyzerOptions)_workspaceAnalyzerOptionsConstructor.Invoke(new object[] { project.AnalyzerOptions, project.Solution });
-            var compilationWithAnalyzers = GetCompliationWtihAnalyzers(allAnalyzers, compilation, workspaceAnalyzerOptions);
+            var compilationWithAnalyzers = await GetCompilationWithAnalyzers(project);
 
             if (compilationWithAnalyzers != null)
                 return await compilationWithAnalyzers.GetAllDiagnosticsAsync();
@@ -261,7 +249,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 var isInitialParse = _hasHadInitialParse.TryAdd(documentsGroupedByProject.Key, true);
                 var isBackgroundInitialParse = workType == AnalyzerWorkType.Background && isInitialParse;
 
-                var compilation = await project.GetCompilationAsync();
+                //var compilation = await project.GetCompilationAsync();
 
                 //if (isBackgroundInitialParse)
                 //{
@@ -278,7 +266,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 //    return;
                 //}
 
-                var compilationWithAnalyzers = isBackgroundInitialParse ? null : GetCompliationWithAnalyzers(project, compilation);
+                var compilationWithAnalyzers = isBackgroundInitialParse ? null : await GetCompilationWithAnalyzers(project);
 
                 foreach (var documentId in documentsGroupedByProject)
                 {
@@ -303,18 +291,6 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             {
                 _logger.LogError($"Analysis of project {documentsGroupedByProject.Key} failed, underlaying error: {ex}");
             }
-        }
-
-        private CompilationWithAnalyzers GetCompliationWithAnalyzers(Project project, Compilation compilation)
-        {
-            var allAnalyzers = _providers
-                .SelectMany(x => x.CodeDiagnosticAnalyzerProviders)
-                .Concat(project.AnalyzerReferences.SelectMany(x => x.GetAnalyzers(project.Language)))
-                .ToImmutableArray();
-
-            var workspaceAnalyzerOptions = (AnalyzerOptions)_workspaceAnalyzerOptionsConstructor.Invoke(new object[] { project.AnalyzerOptions, project.Solution });
-
-            return GetCompliationWtihAnalyzers(allAnalyzers, compilation, workspaceAnalyzerOptions);
         }
 
         private async Task<IEnumerable<Diagnostic>> AnalyzeDocument(Project project, CompilationWithAnalyzers compilationWithAnalyzers, Document document)
@@ -366,8 +342,17 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             }
         }
 
-        private CompilationWithAnalyzers GetCompliationWtihAnalyzers(ImmutableArray<DiagnosticAnalyzer> allAnalyzers, Compilation compilation, AnalyzerOptions workspaceAnalyzerOptions)
+        private async Task<CompilationWithAnalyzers> GetCompilationWithAnalyzers(Project project)
         {
+            var compilation = await project.GetCompilationAsync();
+            var workspaceAnalyzerOptions = (AnalyzerOptions)_workspaceAnalyzerOptionsConstructor.Invoke(new object[] { project.AnalyzerOptions, project.Solution });
+
+            var allAnalyzers = _providers
+                .SelectMany(x => x.CodeDiagnosticAnalyzerProviders)
+                .Concat(project.AnalyzerReferences.SelectMany(x => x.GetAnalyzers(project.Language)))
+                .Where(x => !CompilationWithAnalyzers.IsDiagnosticAnalyzerSuppressed(x, project.CompilationOptions, OnAnalyzerException))
+                .ToImmutableArray();
+
             if (allAnalyzers.Length == 0) // Analyzers cannot be called with empty analyzer list.
                 return null;
 
