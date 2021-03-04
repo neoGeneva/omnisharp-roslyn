@@ -6,10 +6,10 @@ using System.Composition;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Diagnostics;
-using Microsoft.CodeAnalysis.Options;
 using Microsoft.Extensions.Logging;
 using OmniSharp.Helpers;
 using OmniSharp.Models.Diagnostics;
@@ -18,11 +18,14 @@ using OmniSharp.Options;
 using OmniSharp.Roslyn.CSharp.Workers.Diagnostics;
 using OmniSharp.Services;
 
+#nullable enable
+
 namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 {
     public class CSharpDiagnosticWorkerWithAnalyzers : ICsDiagnosticWorker, IDisposable
     {
-        private readonly AnalyzerWorkQueue _workQueue;
+        private readonly Channel<(ImmutableArray<DocumentId>, TaskCompletionSource<object?>?)> _backgroundQueue;
+        private readonly Channel<(ImmutableArray<DocumentId>, TaskCompletionSource<object?>?)> _foregroundQueue;
         private readonly ILogger<CSharpDiagnosticWorkerWithAnalyzers> _logger;
 
         private readonly ConcurrentDictionary<DocumentId, DocumentDiagnostics> _currentDiagnosticResultLookup =
@@ -35,7 +38,6 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             new ConcurrentDictionary<DocumentId, bool>();
         private readonly ConcurrentDictionary<DocumentId, int> _timeoutCounts =
             new ConcurrentDictionary<DocumentId, int>();
-        private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
 
         // This is workaround.
         // Currently roslyn doesn't expose official way to use IDE analyzers during analysis.
@@ -51,7 +53,9 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
         {
             _logger = loggerFactory.CreateLogger<CSharpDiagnosticWorkerWithAnalyzers>();
             _providers = providers.ToImmutableArray();
-            _workQueue = new AnalyzerWorkQueue(loggerFactory, timeoutForPendingWorkMs: options.RoslynExtensionsOptions.DocumentAnalysisTimeoutMs * 3);
+
+            _backgroundQueue = Channel.CreateUnbounded<(ImmutableArray<DocumentId>, TaskCompletionSource<object?>?)>();
+            _foregroundQueue = Channel.CreateUnbounded<(ImmutableArray<DocumentId>, TaskCompletionSource<object?>?)>();
 
             _forwarder = forwarder;
             _options = options;
@@ -92,24 +96,12 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
         {
             if (waitForDocuments)
             {
-                var didQueueUpdate = false;
+                var documentsToEnqueue = documentIds
+                    .Where(x => !_hasFullDiagnostics.ContainsKey(x) /*&& _workspace.IsDocumentOpen(x)*/)
+                    .ToImmutableArray();
 
-                foreach (var documentId in documentIds)
-                {
-                    if (_workQueue.TryPromote(documentId))
-                    {
-                        didQueueUpdate = true;
-                    }
-                    else if (!_hasFullDiagnostics.ContainsKey(documentId) /*&& _workspace.IsDocumentOpen(documentId)*/)
-                    {
-                        didQueueUpdate = true;
-
-                        QueueForAnalysis(ImmutableArray.Create(documentId), AnalyzerWorkType.Foreground);
-                    }
-                }
-
-                if (didQueueUpdate)
-                    await _workQueue.WaitForegroundWorkComplete();
+                if (!documentsToEnqueue.IsEmpty)
+                    await QueueForAnalysis(documentsToEnqueue, AnalyzerWorkType.Foreground, awaitResults: true);
             }
 
             return documentIds
@@ -128,33 +120,23 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 
         private async Task Worker(AnalyzerWorkType workType)
         {
+            var channel = GetChannel(workType);
+
             while (true)
             {
+                TaskCompletionSource<object?>? taskCompletionSource = null;
+
                 try
                 {
-                    var solution = _workspace.CurrentSolution;
+                    var work = await channel.Reader.ReadAsync()
+                        .ConfigureAwait(false);
 
-                    var currentWorkGroupedByProjects = _workQueue
-                        .TakeWork(workType)
-                        .Select(documentId => (projectId: solution.GetDocument(documentId)?.Project?.Id, documentId))
-                        .Where(x => x.projectId != null)
-                        .GroupBy(x => x.projectId, x => x.documentId)
-                        .ToImmutableArray();
+                    taskCompletionSource = work.Item2;
 
-                    foreach (var projectGroup in currentWorkGroupedByProjects)
-                    {
-                        var projectPath = solution.GetProject(projectGroup.Key).FilePath;
+                    await AnalyzeDocuments(work.Item1, workType)
+                        .ConfigureAwait(false);
 
-                        EventIfBackgroundWork(workType, projectPath, ProjectDiagnosticStatus.Started);
-
-                        // TODO: Does breaking the project group into smaller batches help with memory?
-                        await AnalyzeDocuments(solution, projectGroup, workType)
-                            .ConfigureAwait(false);
-
-                        EventIfBackgroundWork(workType, projectPath, ProjectDiagnosticStatus.Ready);
-                    }
-
-                    _workQueue.WorkComplete(workType);
+                    taskCompletionSource?.SetResult(null);
 
                     await Task.Delay(50)
                         .ConfigureAwait(false);
@@ -162,46 +144,75 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 catch (Exception ex)
                 {
                     _logger.LogError($"Analyzer worker failed: {ex}");
+
+                    taskCompletionSource?.SetException(ex);
                 }
             }
         }
 
-        private void EventIfBackgroundWork(AnalyzerWorkType workType, string projectPath, ProjectDiagnosticStatus status)
+        private void EventIfBackgroundWork(AnalyzerWorkType workType, string? projectPath, ProjectDiagnosticStatus status)
         {
             if (workType == AnalyzerWorkType.Background)
                 _forwarder.ProjectAnalyzedInBackground(projectPath, status);
         }
 
-        private void QueueForAnalysis(ImmutableArray<DocumentId> documentIds, AnalyzerWorkType workType)
+        private Task QueueForAnalysis(ImmutableArray<DocumentId> documentIds, AnalyzerWorkType workType, bool awaitResults = false)
         {
-            _workQueue.PutWork(documentIds, workType);
+            var channel = GetChannel(workType);
+            var taskCompletionSource = awaitResults
+                ? new TaskCompletionSource<object?>()
+                : null;
+
+            channel.Writer.TryWrite((documentIds, taskCompletionSource));
+
+            return taskCompletionSource?.Task ?? Task.CompletedTask;
+        }
+
+        private Channel<(ImmutableArray<DocumentId>, TaskCompletionSource<object?>?)> GetChannel(AnalyzerWorkType workType)
+        {
+            return workType == AnalyzerWorkType.Foreground
+                ? _foregroundQueue
+                : _backgroundQueue;
         }
 
         private void OnWorkspaceChanged(object sender, WorkspaceChangeEventArgs changeEvent)
         {
+            Project? project;
+
             switch (changeEvent.Kind)
             {
                 case WorkspaceChangeKind.DocumentChanged:
                 case WorkspaceChangeKind.DocumentAdded:
                 case WorkspaceChangeKind.DocumentReloaded:
                 case WorkspaceChangeKind.DocumentInfoChanged:
-                    QueueForAnalysis(ImmutableArray.Create(changeEvent.DocumentId), AnalyzerWorkType.Background);
+                    if (changeEvent.DocumentId != null)
+                        QueueForAnalysis(ImmutableArray.Create(changeEvent.DocumentId), AnalyzerWorkType.Background);
                     break;
                 case WorkspaceChangeKind.DocumentRemoved:
-                    if (!_currentDiagnosticResultLookup.TryRemove(changeEvent.DocumentId, out _))
+                    if (changeEvent.DocumentId != null && !_currentDiagnosticResultLookup.TryRemove(changeEvent.DocumentId, out _))
                     {
                         _logger.LogDebug($"Tried to remove non existent document from analysis, document: {changeEvent.DocumentId}");
                     }
                     break;
                 case WorkspaceChangeKind.AnalyzerConfigDocumentChanged:
+                    project = _workspace.CurrentSolution.GetProject(changeEvent.ProjectId);
+
                     _logger.LogDebug($"Analyzer config document {changeEvent.DocumentId} changed, which triggered re-analysis of project {changeEvent.ProjectId}.");
-                    QueueForAnalysis(_workspace.CurrentSolution.GetProject(changeEvent.ProjectId).Documents.Select(x => x.Id).ToImmutableArray(), AnalyzerWorkType.Background);
+
+                    if (project != null)
+                        QueueForAnalysis(project.Documents.Select(x => x.Id).ToImmutableArray(), AnalyzerWorkType.Background);
+
                     break;
                 case WorkspaceChangeKind.ProjectAdded:
                 case WorkspaceChangeKind.ProjectChanged:
                 case WorkspaceChangeKind.ProjectReloaded:
+                    project = _workspace.CurrentSolution.GetProject(changeEvent.ProjectId);
+
                     _logger.LogDebug($"Project {changeEvent.ProjectId} updated, reanalyzing its diagnostics.");
-                    QueueForAnalysis(_workspace.CurrentSolution.GetProject(changeEvent.ProjectId).Documents.Select(x => x.Id).ToImmutableArray(), AnalyzerWorkType.Background);
+
+                    if (project != null)
+                        QueueForAnalysis(project.Documents.Select(x => x.Id).ToImmutableArray(), AnalyzerWorkType.Background);
+
                     break;
                 case WorkspaceChangeKind.SolutionAdded:
                 case WorkspaceChangeKind.SolutionChanged:
@@ -234,15 +245,18 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             return diagnostics;
         }
 
-        private async Task AnalyzeDocuments(Solution solution, IEnumerable<DocumentId> documents, AnalyzerWorkType workType)
+        private async Task AnalyzeDocuments(IEnumerable<DocumentId> documents, AnalyzerWorkType workType)
         {
             try
             {
-                CompilationWithAnalyzers compilationWithAnalyzers = null;
+                CompilationWithAnalyzers? compilationWithAnalyzers = null;
 
                 foreach (var documentId in documents)
                 {
-                    var document = solution.GetDocument(documentId);
+                    var document = _workspace.CurrentSolution.GetDocument(documentId);
+
+                    if (document == null)
+                        return;
 
                     //var useAnalyzers = _workspace.IsDocumentOpen(documentId);
                     var useAnalyzers = workType == AnalyzerWorkType.Foreground
@@ -271,10 +285,9 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             }
         }
 
-        private async Task<IEnumerable<Diagnostic>> AnalyzeDocument(Document document, CompilationWithAnalyzers compilationWithAnalyzers, CancellationToken cancellationToken = default)
+        private async Task<IEnumerable<Diagnostic>> AnalyzeDocument(Document document, CompilationWithAnalyzers? compilationWithAnalyzers, CancellationToken cancellationToken = default)
         {
-            IEnumerable<Diagnostic> diagnostics = null;
-            var hasLock = false;
+            IEnumerable<Diagnostic>? diagnostics = null;
 
             // There's real possibility that bug in analyzer causes analysis hang at document.
             using var perDocumentTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -284,11 +297,6 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 
             try
             {
-                await _semaphore.WaitAsync(cancellationToken)
-                    .ConfigureAwait(false);
-
-                hasLock = true;
-
                 perDocumentTimeout.CancelAfter(_options.RoslynExtensionsOptions.DocumentAnalysisTimeoutMs);
 
                 var documentSemanticModel = await document.GetSemanticModelAsync(perDocumentTimeout.Token)
@@ -301,9 +309,12 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                     var syntaxTree = await document.GetSyntaxTreeAsync()
                         .ConfigureAwait(false);
 
+                    if (syntaxTree == null)
+                        return Enumerable.Empty<Diagnostic>();
+
                     diagnostics = syntaxTree.GetDiagnostics(perDocumentTimeout.Token);
                 }
-                else if (compilationWithAnalyzers != null && timeoutCount < 3)
+                else if (compilationWithAnalyzers != null && timeoutCount < 3 && documentSemanticModel != null)
                 {
                     diagnostics = documentSemanticModel.GetDiagnostics(null, perDocumentTimeout.Token);
 
@@ -319,7 +330,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 
                     diagnostics = diagnostics.Concat(syntaxDiagnosticsWithAnalyzers);
                 }
-                else
+                else if (documentSemanticModel != null)
                 {
                     diagnostics = documentSemanticModel.GetDiagnostics(null, perDocumentTimeout.Token);
                 }
@@ -331,26 +342,24 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 
                 _logger.LogError($"Analysis of document {document.Name} failed or cancelled by timeout: {ex.Message}");
             }
-            finally
-            {
-                if (hasLock)
-                    _semaphore.Release();
-            }
 
             return diagnostics ?? Enumerable.Empty<Diagnostic>();
         }
 
-        private async Task<CompilationWithAnalyzers> GetCompilationWithAnalyzers(Project project, CancellationToken cancellationToken = default)
+        private async Task<CompilationWithAnalyzers?> GetCompilationWithAnalyzers(Project project, CancellationToken cancellationToken = default)
         {
             var compilation = await project.GetCompilationAsync(cancellationToken)
                 .ConfigureAwait(false);
+
+            if (compilation == null)
+                return null;
 
             var workspaceAnalyzerOptions = (AnalyzerOptions)_workspaceAnalyzerOptionsConstructor.Invoke(new object[] { project.AnalyzerOptions, project.Solution });
 
             var allAnalyzers = _providers
                 .SelectMany(x => x.CodeDiagnosticAnalyzerProviders)
                 .Concat(project.AnalyzerReferences.SelectMany(x => x.GetAnalyzers(project.Language)))
-                .Where(x => !CompilationWithAnalyzers.IsDiagnosticAnalyzerSuppressed(x, project.CompilationOptions, OnAnalyzerException))
+                .Where(x => project.CompilationOptions != null && !CompilationWithAnalyzers.IsDiagnosticAnalyzerSuppressed(x, project.CompilationOptions, OnAnalyzerException))
                 .ToImmutableArray();
 
             if (allAnalyzers.Length == 0) // Analyzers cannot be called with empty analyzer list.
@@ -403,9 +412,19 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 
         public ImmutableArray<DocumentId> QueueDocumentsForDiagnostics()
         {
-            var documentIds = _workspace.CurrentSolution.Projects.SelectMany(x => x.DocumentIds).ToImmutableArray();
-            QueueForAnalysis(documentIds, AnalyzerWorkType.Background);
-            return documentIds;
+            Task.Run(async () =>
+            {
+                foreach (var project in _workspace.CurrentSolution.Projects)
+                {
+                    EventIfBackgroundWork(AnalyzerWorkType.Background, project.FilePath, ProjectDiagnosticStatus.Started);
+
+                    await QueueForAnalysis(project.DocumentIds.ToImmutableArray(), AnalyzerWorkType.Background, awaitResults: true);
+
+                    EventIfBackgroundWork(AnalyzerWorkType.Background, project.FilePath, ProjectDiagnosticStatus.Ready);
+                }
+            });
+
+            return _workspace.CurrentSolution.Projects.SelectMany(x => x.DocumentIds).ToImmutableArray();
         }
 
         public async Task<ImmutableArray<DocumentDiagnostics>> GetAllDiagnosticsAsync()
@@ -417,7 +436,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
         public ImmutableArray<DocumentId> QueueDocumentsForDiagnostics(ImmutableArray<ProjectId> projectIds)
         {
             var documentIds = projectIds
-                .SelectMany(projectId => _workspace.CurrentSolution.GetProject(projectId).Documents.Select(x => x.Id))
+                .SelectMany(projectId => _workspace.CurrentSolution.GetProject(projectId)?.Documents.Select(x => x.Id) ?? Enumerable.Empty<DocumentId>())
                 .ToImmutableArray();
             QueueForAnalysis(documentIds, AnalyzerWorkType.Background);
             return documentIds;

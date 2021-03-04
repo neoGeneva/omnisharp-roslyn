@@ -73,6 +73,7 @@
         <PackageReference Update="System.Reflection.Metadata" Version="5.0.0" />
         <PackageReference Update="System.Threading.Tasks.Dataflow" Version="5.0.0" />
         <PackageReference Update="System.ValueTuple" Version="4.5.0" />
+        <PackageReference Update="System.Threading.Channels" Version="4.7.1" />
 
         <PackageReference Update="System.Reactive" Version="4.4.1" />
 
