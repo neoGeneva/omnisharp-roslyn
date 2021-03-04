@@ -24,8 +24,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 {
     public class CSharpDiagnosticWorkerWithAnalyzers : ICsDiagnosticWorker, IDisposable
     {
-        private readonly Channel<(ImmutableArray<DocumentId> DocumentIds, TaskCompletionSource<object?>? TaskCompletionSource)> _backgroundQueue;
-        private readonly Channel<(ImmutableArray<DocumentId> DocumentIds, TaskCompletionSource<object?>? TaskCompletionSource)> _foregroundQueue;
+        private readonly Channel<ChannelWork>[] _channels;
         private readonly ILogger<CSharpDiagnosticWorkerWithAnalyzers> _logger;
 
         private readonly ConcurrentDictionary<DocumentId, DocumentDiagnostics> _currentDiagnosticResultLookup =
@@ -54,8 +53,14 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             _logger = loggerFactory.CreateLogger<CSharpDiagnosticWorkerWithAnalyzers>();
             _providers = providers.ToImmutableArray();
 
-            _backgroundQueue = Channel.CreateUnbounded<(ImmutableArray<DocumentId>, TaskCompletionSource<object?>?)>();
-            _foregroundQueue = Channel.CreateUnbounded<(ImmutableArray<DocumentId>, TaskCompletionSource<object?>?)>();
+
+            var workPriorities = Enum.GetValues(typeof(WorkPriority))
+                .Cast<WorkPriority>()
+                .ToList();
+
+            _channels = workPriorities
+                .Select(x => Channel.CreateUnbounded<ChannelWork>())
+                .ToArray();
 
             _forwarder = forwarder;
             _options = options;
@@ -70,8 +75,8 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             _workspace.WorkspaceChanged += OnWorkspaceChanged;
             _workspace.OnInitialized += OnWorkspaceInitialized;
 
-            Task.Factory.StartNew(() => Worker(AnalyzerWorkType.Foreground), TaskCreationOptions.LongRunning);
-            Task.Factory.StartNew(() => Worker(AnalyzerWorkType.Background), TaskCreationOptions.LongRunning);
+            foreach (var priority in workPriorities)
+                Task.Factory.StartNew(() => Worker(priority), TaskCreationOptions.LongRunning);
 
             OnWorkspaceInitialized(_workspace.Initialized);
         }
@@ -101,7 +106,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                     .ToImmutableArray();
 
                 if (!documentsToEnqueue.IsEmpty)
-                    await QueueForAnalysis(documentsToEnqueue, AnalyzerWorkType.Foreground, awaitResults: true);
+                    await QueueForAnalysis(documentsToEnqueue, WorkPriority.High, awaitResults: true);
             }
 
             return documentIds
@@ -118,22 +123,22 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 .ToImmutableArray();
         }
 
-        private async Task Worker(AnalyzerWorkType workType)
+        private async Task Worker(WorkPriority workPriority)
         {
-            var channel = GetChannel(workType);
-
+            var channels = _channels.Take((int)workPriority + 1).ToArray();
+            
             while (true)
             {
                 TaskCompletionSource<object?>? taskCompletionSource = null;
 
                 try
                 {
-                    var work = await channel.Reader.ReadAsync()
+                    var work = await GetNextWorkItem(channels)
                         .ConfigureAwait(false);
 
                     taskCompletionSource = work.TaskCompletionSource;
 
-                    await AnalyzeDocuments(work.DocumentIds, workType)
+                    await AnalyzeDocuments(work.DocumentIds, workPriority)
                         .ConfigureAwait(false);
 
                     taskCompletionSource?.SetResult(null);
@@ -150,29 +155,38 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             }
         }
 
-        private void EventIfBackgroundWork(AnalyzerWorkType workType, string? projectPath, ProjectDiagnosticStatus status)
+        private async ValueTask<ChannelWork> GetNextWorkItem(Channel<ChannelWork>[] channels)
         {
-            if (workType == AnalyzerWorkType.Background)
-                _forwarder.ProjectAnalyzedInBackground(projectPath, status);
+            while (true)
+            {
+                foreach (var channel in channels)
+                {
+                    if (channel.Reader.TryRead(out var workItem))
+                        return workItem;
+                }
+
+                var tasks = channels.Select(x => x.Reader.WaitToReadAsync().AsTask()).ToArray();
+
+                await Task.WhenAny(tasks)
+                    .ConfigureAwait(false);
+            }
         }
 
-        private Task QueueForAnalysis(ImmutableArray<DocumentId> documentIds, AnalyzerWorkType workType, bool awaitResults = false)
+        private Task QueueForAnalysis(ImmutableArray<DocumentId> documentIds, WorkPriority workPriority, bool awaitResults = false)
         {
-            var channel = GetChannel(workType);
+            var channel = GetChannel(workPriority);
             var taskCompletionSource = awaitResults
                 ? new TaskCompletionSource<object?>()
                 : null;
 
-            channel.Writer.TryWrite((documentIds, taskCompletionSource));
+            channel.Writer.TryWrite(new ChannelWork(documentIds, taskCompletionSource));
 
             return taskCompletionSource?.Task ?? Task.CompletedTask;
         }
 
-        private Channel<(ImmutableArray<DocumentId> DocumentIds, TaskCompletionSource<object?>? TaskCompletionSource)> GetChannel(AnalyzerWorkType workType)
+        private Channel<ChannelWork> GetChannel(WorkPriority workPriority)
         {
-            return workType == AnalyzerWorkType.Foreground
-                ? _foregroundQueue
-                : _backgroundQueue;
+            return _channels[(int)workPriority];
         }
 
         private void OnWorkspaceChanged(object sender, WorkspaceChangeEventArgs changeEvent)
@@ -186,7 +200,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 case WorkspaceChangeKind.DocumentReloaded:
                 case WorkspaceChangeKind.DocumentInfoChanged:
                     if (changeEvent.DocumentId != null)
-                        QueueForAnalysis(ImmutableArray.Create(changeEvent.DocumentId), AnalyzerWorkType.Background);
+                        QueueForAnalysis(ImmutableArray.Create(changeEvent.DocumentId), WorkPriority.Medium);
                     break;
                 case WorkspaceChangeKind.DocumentRemoved:
                     if (changeEvent.DocumentId != null && !_currentDiagnosticResultLookup.TryRemove(changeEvent.DocumentId, out _))
@@ -200,7 +214,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                     _logger.LogDebug($"Analyzer config document {changeEvent.DocumentId} changed, which triggered re-analysis of project {changeEvent.ProjectId}.");
 
                     if (project != null)
-                        QueueForAnalysis(project.Documents.Select(x => x.Id).ToImmutableArray(), AnalyzerWorkType.Background);
+                        QueueForAnalysis(project.Documents.Select(x => x.Id).ToImmutableArray(), WorkPriority.Medium);
 
                     break;
                 case WorkspaceChangeKind.ProjectAdded:
@@ -211,7 +225,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                     _logger.LogDebug($"Project {changeEvent.ProjectId} updated, reanalyzing its diagnostics.");
 
                     if (project != null)
-                        QueueForAnalysis(project.Documents.Select(x => x.Id).ToImmutableArray(), AnalyzerWorkType.Background);
+                        QueueForAnalysis(project.Documents.Select(x => x.Id).ToImmutableArray(), WorkPriority.Medium);
 
                     break;
                 case WorkspaceChangeKind.SolutionAdded:
@@ -245,7 +259,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             return diagnostics;
         }
 
-        private async Task AnalyzeDocuments(IEnumerable<DocumentId> documents, AnalyzerWorkType workType)
+        private async Task AnalyzeDocuments(IEnumerable<DocumentId> documents, WorkPriority workPriority)
         {
             try
             {
@@ -259,7 +273,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                         return;
 
                     //var useAnalyzers = _workspace.IsDocumentOpen(documentId);
-                    var useAnalyzers = workType == AnalyzerWorkType.Foreground
+                    var useAnalyzers = workPriority == WorkPriority.High
                         || _hasFullDiagnostics.ContainsKey(documentId);
 
                     if (useAnalyzers && compilationWithAnalyzers == null)
@@ -419,11 +433,11 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             {
                 foreach (var project in _workspace.CurrentSolution.Projects)
                 {
-                    EventIfBackgroundWork(AnalyzerWorkType.Background, project.FilePath, ProjectDiagnosticStatus.Started);
+                    _forwarder.ProjectAnalyzedInBackground(project.FilePath, ProjectDiagnosticStatus.Started);
 
-                    await QueueForAnalysis(project.DocumentIds.ToImmutableArray(), AnalyzerWorkType.Background, awaitResults: true);
+                    await QueueForAnalysis(project.DocumentIds.ToImmutableArray(), WorkPriority.Medium, awaitResults: true);
 
-                    EventIfBackgroundWork(AnalyzerWorkType.Background, project.FilePath, ProjectDiagnosticStatus.Ready);
+                    _forwarder.ProjectAnalyzedInBackground(project.FilePath, ProjectDiagnosticStatus.Ready);
                 }
             });
 
@@ -441,7 +455,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             var documentIds = projectIds
                 .SelectMany(projectId => _workspace.CurrentSolution.GetProject(projectId)?.Documents.Select(x => x.Id) ?? Enumerable.Empty<DocumentId>())
                 .ToImmutableArray();
-            QueueForAnalysis(documentIds, AnalyzerWorkType.Background);
+            QueueForAnalysis(documentIds, WorkPriority.Medium);
             return documentIds;
         }
 
@@ -449,6 +463,26 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
         {
             _workspace.WorkspaceChanged -= OnWorkspaceChanged;
             _workspace.OnInitialized -= OnWorkspaceInitialized;
+        }
+
+
+        private enum WorkPriority
+        {
+            High = 0,
+            Medium = 1,
+            Low = 2,
+        }
+
+        private class ChannelWork
+        {
+            public ChannelWork(ImmutableArray<DocumentId> documentIds, TaskCompletionSource<object?>? taskCompletionSource)
+            {
+                DocumentIds = documentIds;
+                TaskCompletionSource = taskCompletionSource;
+            }
+
+            public ImmutableArray<DocumentId> DocumentIds { get; }
+            public TaskCompletionSource<object?>? TaskCompletionSource { get; }
         }
     }
 }
