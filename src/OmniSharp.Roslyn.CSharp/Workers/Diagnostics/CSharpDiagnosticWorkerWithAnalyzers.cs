@@ -33,6 +33,8 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
         private readonly OmniSharpWorkspace _workspace;
         private readonly ConcurrentDictionary<DocumentId, bool> _hasFullDiagnostics =
             new ConcurrentDictionary<DocumentId, bool>();
+        private readonly ConcurrentDictionary<DocumentId, int> _timeoutCounts =
+            new ConcurrentDictionary<DocumentId, int>();
         private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
 
         // This is workaround.
@@ -90,13 +92,24 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
         {
             if (waitForDocuments)
             {
+                var didQueueUpdate = false;
+
                 foreach (var documentId in documentIds)
                 {
-                    if (!_workQueue.TryPromote(documentId) && !_hasFullDiagnostics.ContainsKey(documentId))
+                    if (_workQueue.TryPromote(documentId))
+                    {
+                        didQueueUpdate = true;
+                    }
+                    else if (!_hasFullDiagnostics.ContainsKey(documentId) /*&& _workspace.IsDocumentOpen(documentId)*/)
+                    {
+                        didQueueUpdate = true;
+
                         QueueForAnalysis(ImmutableArray.Create(documentId), AnalyzerWorkType.Foreground);
+                    }
                 }
 
-                await _workQueue.WaitForegroundWorkComplete();
+                if (didQueueUpdate)
+                    await _workQueue.WaitForegroundWorkComplete();
             }
 
             return documentIds
@@ -128,24 +141,18 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                         .GroupBy(x => x.projectId, x => x.documentId)
                         .ToImmutableArray();
 
-                    //var tasks = currentWorkGroupedByProjects
-                    //    .AsParallel()
-                    //    .Select(async projectGroup =>
-                    //    {
                     foreach (var projectGroup in currentWorkGroupedByProjects)
                     {
                         var projectPath = solution.GetProject(projectGroup.Key).FilePath;
 
                         EventIfBackgroundWork(workType, projectPath, ProjectDiagnosticStatus.Started);
 
-                        await AnalyzeProject(solution, projectGroup, workType)
+                        // TODO: Does breaking the project group into smaller batches help with memory?
+                        await AnalyzeDocuments(solution, projectGroup, workType)
                             .ConfigureAwait(false);
 
                         EventIfBackgroundWork(workType, projectPath, ProjectDiagnosticStatus.Ready);
                     }
-                    //});
-                    //
-                    //await Task.WhenAll(tasks);
 
                     _workQueue.WorkComplete(workType);
 
@@ -207,9 +214,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 
         public async Task<IEnumerable<Diagnostic>> AnalyzeDocumentAsync(Document document, CancellationToken cancellationToken)
         {
-            Project project = document.Project;
-
-            var compilationWithAnalyzers = await GetCompilationWithAnalyzers(project, cancellationToken);
+            var compilationWithAnalyzers = await GetCompilationWithAnalyzers(document.Project, cancellationToken);
 
             return await AnalyzeDocument(document, compilationWithAnalyzers, cancellationToken);
         }
@@ -229,33 +234,40 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             return diagnostics;
         }
 
-        private async Task AnalyzeProject(Solution solution, IGrouping<ProjectId, DocumentId> documentsGroupedByProject, AnalyzerWorkType workType)
+        private async Task AnalyzeDocuments(Solution solution, IEnumerable<DocumentId> documents, AnalyzerWorkType workType)
         {
             try
             {
-                var project = solution.GetProject(documentsGroupedByProject.Key);
+                CompilationWithAnalyzers compilationWithAnalyzers = null;
 
-                var compilationWithAnalyzers = await GetCompilationWithAnalyzers(project);
-
-                foreach (var documentId in documentsGroupedByProject)
+                foreach (var documentId in documents)
                 {
-                    var document = project.GetDocument(documentId);
+                    var document = solution.GetDocument(documentId);
 
-                    var useAnalytics = workType == AnalyzerWorkType.Foreground
+                    //var useAnalyzers = _workspace.IsDocumentOpen(documentId);
+                    var useAnalyzers = workType == AnalyzerWorkType.Foreground
                         || _hasFullDiagnostics.ContainsKey(documentId);
 
-                    var diagnostics = await AnalyzeDocument(document, useAnalytics ? compilationWithAnalyzers : null)
+                    if (useAnalyzers && compilationWithAnalyzers == null)
+                    {
+                        compilationWithAnalyzers = await GetCompilationWithAnalyzers(document.Project)
+                            .ConfigureAwait(false);
+                    }
+
+                    var diagnostics = await AnalyzeDocument(document, useAnalyzers ? compilationWithAnalyzers : null)
                         .ConfigureAwait(false);
 
-                    UpdateCurrentDiagnostics(project, document, diagnostics);
+                    UpdateCurrentDiagnostics(document, diagnostics);
 
-                    if (workType == AnalyzerWorkType.Foreground)
+                    if (useAnalyzers)
                         _hasFullDiagnostics.TryAdd(documentId, true);
+                    //else
+                    //    _hasFullDiagnostics.TryRemove(documentId, out _);
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError($"Analysis of project {documentsGroupedByProject.Key} failed, underlaying error: {ex}");
+                _logger.LogError($"Analysis of documents failed, underlaying error: {ex}");
             }
         }
 
@@ -264,17 +276,20 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             IEnumerable<Diagnostic> diagnostics = null;
             var hasLock = false;
 
+            // There's real possibility that bug in analyzer causes analysis hang at document.
+            using var perDocumentTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+            if (!_timeoutCounts.TryGetValue(document.Id, out var timeoutCount))
+                timeoutCount = 0;
+
             try
             {
-                // There's real possibility that bug in analyzer causes analysis hang at document.
-                using var perDocumentTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-
-                perDocumentTimeout.CancelAfter(_options.RoslynExtensionsOptions.DocumentAnalysisTimeoutMs);
-
-                await _semaphore.WaitAsync(perDocumentTimeout.Token)
+                await _semaphore.WaitAsync(cancellationToken)
                     .ConfigureAwait(false);
 
                 hasLock = true;
+
+                perDocumentTimeout.CancelAfter(_options.RoslynExtensionsOptions.DocumentAnalysisTimeoutMs);
 
                 var documentSemanticModel = await document.GetSemanticModelAsync(perDocumentTimeout.Token)
                     .ConfigureAwait(false);
@@ -288,7 +303,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 
                     diagnostics = syntaxTree.GetDiagnostics(perDocumentTimeout.Token);
                 }
-                else if (compilationWithAnalyzers != null)
+                else if (compilationWithAnalyzers != null && timeoutCount < 3)
                 {
                     diagnostics = documentSemanticModel.GetDiagnostics(null, perDocumentTimeout.Token);
 
@@ -311,6 +326,9 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             }
             catch (Exception ex)
             {
+                if (perDocumentTimeout.IsCancellationRequested)
+                    _timeoutCounts.AddOrUpdate(document.Id, timeoutCount + 1, (id, val) => val + 1);
+
                 _logger.LogError($"Analysis of document {document.Name} failed or cancelled by timeout: {ex.Message}");
             }
             finally
@@ -354,13 +372,13 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 $"\n            exception: {ex.Message}");
         }
 
-        private void UpdateCurrentDiagnostics(Project project, Document document, IEnumerable<Diagnostic> diagnosticsWithAnalyzers)
+        private void UpdateCurrentDiagnostics(Document document, IEnumerable<Diagnostic> diagnosticsWithAnalyzers)
         {
             _currentDiagnosticResultLookup[document.Id] = new DocumentDiagnostics(
                 document.Id,
                 document.FilePath,
-                project.Id,
-                project.Name,
+                document.Project.Id,
+                document.Project.Name,
                 diagnosticsWithAnalyzers.ToImmutableArray()
             );
 
