@@ -24,8 +24,8 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 {
     public class CSharpDiagnosticWorkerWithAnalyzers : ICsDiagnosticWorker, IDisposable
     {
-        private readonly Channel<(ImmutableArray<DocumentId>, TaskCompletionSource<object?>?)> _backgroundQueue;
-        private readonly Channel<(ImmutableArray<DocumentId>, TaskCompletionSource<object?>?)> _foregroundQueue;
+        private readonly Channel<(ImmutableArray<DocumentId> DocumentIds, TaskCompletionSource<object?>? TaskCompletionSource)> _backgroundQueue;
+        private readonly Channel<(ImmutableArray<DocumentId> DocumentIds, TaskCompletionSource<object?>? TaskCompletionSource)> _foregroundQueue;
         private readonly ILogger<CSharpDiagnosticWorkerWithAnalyzers> _logger;
 
         private readonly ConcurrentDictionary<DocumentId, DocumentDiagnostics> _currentDiagnosticResultLookup =
@@ -131,9 +131,9 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                     var work = await channel.Reader.ReadAsync()
                         .ConfigureAwait(false);
 
-                    taskCompletionSource = work.Item2;
+                    taskCompletionSource = work.TaskCompletionSource;
 
-                    await AnalyzeDocuments(work.Item1, workType)
+                    await AnalyzeDocuments(work.DocumentIds, workType)
                         .ConfigureAwait(false);
 
                     taskCompletionSource?.SetResult(null);
@@ -168,7 +168,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             return taskCompletionSource?.Task ?? Task.CompletedTask;
         }
 
-        private Channel<(ImmutableArray<DocumentId>, TaskCompletionSource<object?>?)> GetChannel(AnalyzerWorkType workType)
+        private Channel<(ImmutableArray<DocumentId> DocumentIds, TaskCompletionSource<object?>? TaskCompletionSource)> GetChannel(AnalyzerWorkType workType)
         {
             return workType == AnalyzerWorkType.Foreground
                 ? _foregroundQueue
@@ -322,6 +322,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                         .GetAnalyzerSemanticDiagnosticsAsync(documentSemanticModel, filterSpan: null, perDocumentTimeout.Token)
                         .ConfigureAwait(false);
 
+                    // TODO: This should be calling UpdateCurrentDiagnostics() as it goes
                     diagnostics = diagnostics.Concat(semanticDiagnosticsWithAnalyzers);
 
                     var syntaxDiagnosticsWithAnalyzers = await compilationWithAnalyzers
@@ -337,6 +338,8 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             }
             catch (Exception ex)
             {
+                // TODO: Instead of timing out, maybe let this continue on (in a way that doesn't block background or forground queues)?
+
                 if (perDocumentTimeout.IsCancellationRequested)
                     _timeoutCounts.AddOrUpdate(document.Id, timeoutCount + 1, (id, val) => val + 1);
 
