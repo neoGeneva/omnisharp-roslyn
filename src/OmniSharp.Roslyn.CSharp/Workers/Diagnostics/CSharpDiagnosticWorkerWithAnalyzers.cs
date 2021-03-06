@@ -26,6 +26,8 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 {
     public class CSharpDiagnosticWorkerWithAnalyzers : ICsDiagnosticWorker, IDisposable
     {
+        private const string UpdateNonExistantError = "Tried to update non-existant diagnostic.";
+
         private readonly Channel<ChannelWork>[] _channels;
         private readonly ConcurrentDictionary<DocumentId, ChannelWork> _workingItems =
             new ConcurrentDictionary<DocumentId, ChannelWork>();
@@ -146,7 +148,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                             .ToList();
                     }
 
-                    await AnalyzeDocuments(work.ProjectId, documentIds, work.WorkPriority)
+                    await AnalyzeDocuments(work.ProjectId, documentIds, work.WorkPriority, work.WorkStep)
                         .ConfigureAwait(false);
 
                     taskCompletionSource?.SetResult(null);
@@ -188,7 +190,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             }
         }
 
-        private Task QueueForAnalysis(ProjectId? projectId, ImmutableArray<DocumentId>? documentIds, WorkPriority workPriority, bool awaitResults = false)
+        private Task QueueForAnalysis(ProjectId? projectId, ImmutableArray<DocumentId>? documentIds, WorkPriority workPriority, bool awaitResults = false, int workStep = 0)
         {
             //workPriority = workPriority == WorkPriority.Medium && _workspace.IsDocumentOpen(documentId) ? WorkPriority.High : workPriority;
 
@@ -197,7 +199,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 ? new TaskCompletionSource<object?>()
                 : null;
 
-            channel.Writer.TryWrite(new ChannelWork(workPriority, projectId, documentIds, taskCompletionSource));
+            channel.Writer.TryWrite(new ChannelWork(workPriority, projectId, documentIds, taskCompletionSource, workStep));
 
             return taskCompletionSource?.Task ?? Task.CompletedTask;
         }
@@ -253,7 +255,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
         {
             var compilationWithAnalyzers = await GetCompilationWithAnalyzers(document.Project, cancellationToken);
 
-            return await AnalyzeDocument(document, WorkPriority.High, compilationWithAnalyzers, cancellationToken);
+            return await AnalyzeDocument(document, WorkPriority.High, compilationWithAnalyzers, cancellationToken: cancellationToken);
         }
 
         public async Task<IEnumerable<Diagnostic>> AnalyzeProjectsAsync(Project project, CancellationToken cancellationToken)
@@ -266,12 +268,12 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 return await compilationWithAnalyzers.GetAllDiagnosticsAsync(cancellationToken);
 
             foreach (var document in project.Documents)
-                diagnostics.AddRange(await AnalyzeDocument(document, WorkPriority.High, compilationWithAnalyzers, cancellationToken));
+                diagnostics.AddRange(await AnalyzeDocument(document, WorkPriority.High, compilationWithAnalyzers, cancellationToken: cancellationToken));
 
             return diagnostics;
         }
 
-        private async Task AnalyzeDocuments(ProjectId? projectId, IEnumerable<DocumentId>? documents, WorkPriority workPriority)
+        private async Task AnalyzeDocuments(ProjectId? projectId, IEnumerable<DocumentId>? documents, WorkPriority workPriority, int startAtWorkStep)
         {
             try
             {
@@ -293,7 +295,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                             compilationWithAnalyzers ??= await GetCompilationWithAnalyzers(document.Project)
                                 .ConfigureAwait(false);
 
-                            await AnalyzeDocument(document, workPriority, compilationWithAnalyzers)
+                            await AnalyzeDocument(document, workPriority, compilationWithAnalyzers, startAtWorkStep)
                                 .ConfigureAwait(false);
                         }
                     }
@@ -330,12 +332,17 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             }
         }
 
-        private async Task<IEnumerable<Diagnostic>> AnalyzeDocument(Document document, WorkPriority workPriority, CompilationWithAnalyzers? compilationWithAnalyzers, CancellationToken cancellationToken = default)
+        private async Task<IEnumerable<Diagnostic>> AnalyzeDocument(Document document,
+            WorkPriority workPriority,
+            CompilationWithAnalyzers? compilationWithAnalyzers,
+            int startAtWorkStep = 0,
+            CancellationToken cancellationToken = default)
         {
             IEnumerable<Diagnostic>? diagnostics = null;
 
             // There's real possibility that bug in analyzer causes analysis hang at document.
             using var perDocumentTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var currentWorkStep = startAtWorkStep;
 
             try
             {
@@ -362,30 +369,39 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                     diagnostics = syntaxTree.GetDiagnostics(perDocumentTimeout.Token);
 
                     UpdateCurrentDiagnostics(document, diagnostics);
+
                 }
                 else if (compilationWithAnalyzers != null && documentSemanticModel != null && workPriority != WorkPriority.Medium)
                 {
-                    // TODO: Split out basic / analyzer diagnostics, so different priority work threads don't overwrite the wrong data
+                    if (currentWorkStep < 1)
+                    {
+                        diagnostics = documentSemanticModel.GetDiagnostics(null, perDocumentTimeout.Token);
 
-                    diagnostics = documentSemanticModel.GetDiagnostics(null, perDocumentTimeout.Token);
+                        currentWorkStep = 1;
 
-                    UpdateCurrentDiagnostics(document, diagnostics);
+                        UpdateCurrentDiagnostics(document, diagnostics);
+                    }
 
-                    var semanticDiagnosticsWithAnalyzers = await compilationWithAnalyzers
-                        .GetAnalyzerSemanticDiagnosticsAsync(documentSemanticModel, filterSpan: null, perDocumentTimeout.Token)
-                        .ConfigureAwait(false);
+                    if (currentWorkStep < 2)
+                    {
+                        var semanticDiagnostics = await compilationWithAnalyzers
+                            .GetAnalyzerSemanticDiagnosticsAsync(documentSemanticModel, filterSpan: null, perDocumentTimeout.Token)
+                            .ConfigureAwait(false);
 
-                    diagnostics = diagnostics.Concat(semanticDiagnosticsWithAnalyzers);
+                        diagnostics = diagnostics.Concat(semanticDiagnostics);
 
-                    UpdateCurrentDiagnostics(document, diagnostics);
+                        currentWorkStep = 2;
 
-                    var syntaxDiagnosticsWithAnalyzers = await compilationWithAnalyzers
+                        UpdateSemanticDiagnostics(document.Id, semanticDiagnostics);
+                    }
+
+                    var syntaxDiagnostics = await compilationWithAnalyzers
                         .GetAnalyzerSyntaxDiagnosticsAsync(documentSemanticModel.SyntaxTree, perDocumentTimeout.Token)
                         .ConfigureAwait(false);
 
-                    diagnostics = diagnostics.Concat(syntaxDiagnosticsWithAnalyzers);
+                    diagnostics = diagnostics.Concat(syntaxDiagnostics);
 
-                    UpdateCurrentDiagnostics(document, diagnostics);
+                    UpdateSyntaxDiagnostics(document.Id, syntaxDiagnostics);
                 }
                 else if (documentSemanticModel != null)
                 {
@@ -404,7 +420,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 {
                     _logger.LogWarning($"Analysis of document {document.Name} timed out, sending from {workPriority} to {WorkPriority.Low} priority queue.");
 
-                    await QueueForAnalysis(null, ImmutableArray.Create(document.Id), WorkPriority.Low);
+                    _ = QueueForAnalysis(null, ImmutableArray.Create(document.Id), WorkPriority.Low, workStep: currentWorkStep);
                 }
             }
 
@@ -448,15 +464,81 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 
         private void UpdateCurrentDiagnostics(Document document, IEnumerable<Diagnostic> diagnosticsWithAnalyzers)
         {
-            _currentDiagnosticResultLookup[document.Id] = new DocumentDiagnostics(
-                document.Id,
-                document.FilePath,
-                document.Project.Id,
-                document.Project.Name,
-                diagnosticsWithAnalyzers.ToImmutableArray()
-            );
+            var documentDiagnostics = _currentDiagnosticResultLookup.AddOrUpdate(document.Id,
+                (key) => new DocumentDiagnostics(
+                    document.Id,
+                    document.FilePath,
+                    document.Project.Id,
+                    document.Project.Name,
+                    diagnosticsWithAnalyzers.ToImmutableArray()
+                ),
+                (key, old) => new DocumentDiagnostics(
+                    document.Id,
+                    document.FilePath,
+                    document.Project.Id,
+                    document.Project.Name,
+                    diagnosticsWithAnalyzers.ToImmutableArray(),
+                    old.SemanticDiagnostics,
+                    old.SyntaxDiagnostics
+                ));
 
-            EmitDiagnostics(_currentDiagnosticResultLookup[document.Id]);
+            EmitDiagnostics(documentDiagnostics);
+        }
+
+        private void UpdateSemanticDiagnostics(DocumentId documentId, ImmutableArray<Diagnostic> semanticDiagnostics)
+        {
+            DocumentDiagnostics documentDiagnostics;
+
+            try
+            {
+                documentDiagnostics = _currentDiagnosticResultLookup.AddOrUpdate(documentId,
+                    (key) => throw new InvalidOperationException(UpdateNonExistantError),
+                    (key, old) => new DocumentDiagnostics(
+                        old.DocumentId,
+                        old.DocumentPath,
+                        old.ProjectId,
+                        old.ProjectName,
+                        old.Diagnostics,
+                        semanticDiagnostics,
+                        old.SyntaxDiagnostics
+                    ));
+            }
+            catch (InvalidOperationException ex) when (ex.Message == UpdateNonExistantError)
+            {
+                _logger.LogWarning(ex.Message);
+
+                return;
+            }
+
+            EmitDiagnostics(documentDiagnostics);
+        }
+
+        private void UpdateSyntaxDiagnostics(DocumentId documentId, ImmutableArray<Diagnostic> syntaxDiagnostics)
+        {
+            DocumentDiagnostics documentDiagnostics;
+
+            try
+            {
+                documentDiagnostics = _currentDiagnosticResultLookup.AddOrUpdate(documentId,
+                    (key) => throw new InvalidOperationException(UpdateNonExistantError),
+                    (key, old) => new DocumentDiagnostics(
+                        old.DocumentId,
+                        old.DocumentPath,
+                        old.ProjectId,
+                        old.ProjectName,
+                        old.Diagnostics,
+                        old.SemanticDiagnostics,
+                        syntaxDiagnostics
+                    ));
+            }
+            catch (InvalidOperationException ex) when (ex.Message == UpdateNonExistantError)
+            {
+                _logger.LogWarning(ex.Message);
+
+                return;
+            }
+
+            EmitDiagnostics(documentDiagnostics);
         }
 
         private void EmitDiagnostics(DocumentDiagnostics results)
@@ -467,7 +549,10 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 {
                     new DiagnosticResult
                     {
-                        FileName = results.DocumentPath, QuickFixes = results.Diagnostics
+                        FileName = results.DocumentPath,
+                        QuickFixes = results.Diagnostics
+                            .Concat(results.SyntaxDiagnostics ?? Enumerable.Empty<Diagnostic>())
+                            .Concat(results.SemanticDiagnostics ?? Enumerable.Empty<Diagnostic>())
                             .Select(x => x.ToDiagnosticLocation())
                             .ToList()
                     }
@@ -526,18 +611,24 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 
         private class ChannelWork
         {
-            public ChannelWork(WorkPriority workPriority, ProjectId? projectId, ImmutableArray<DocumentId>? documentIds, TaskCompletionSource<object?>? taskCompletionSource)
+            public ChannelWork(WorkPriority workPriority,
+                ProjectId? projectId,
+                ImmutableArray<DocumentId>? documentIds,
+                TaskCompletionSource<object?>? taskCompletionSource,
+                int workStep)
             {
                 WorkPriority = workPriority;
                 ProjectId = projectId;
                 DocumentIds = documentIds;
                 TaskCompletionSource = taskCompletionSource;
+                WorkStep = workStep;
             }
 
             public WorkPriority WorkPriority { get; }
             public ProjectId? ProjectId { get; }
             public ImmutableArray<DocumentId>? DocumentIds { get; }
             public TaskCompletionSource<object?>? TaskCompletionSource { get; }
+            public int WorkStep { get; }
         }
     }
 }
