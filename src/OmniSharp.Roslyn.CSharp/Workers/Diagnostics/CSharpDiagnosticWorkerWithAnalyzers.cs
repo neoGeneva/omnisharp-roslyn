@@ -29,8 +29,8 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
         private const string UpdateNonExistantError = "Tried to update non-existant diagnostic.";
 
         private readonly Channel<ChannelWork>[] _channels;
-        private readonly ConcurrentDictionary<DocumentId, ChannelWork> _workingItems =
-            new ConcurrentDictionary<DocumentId, ChannelWork>();
+        private readonly ConcurrentDictionary<DocumentId, CancellationTokenSource> _workingItems =
+            new ConcurrentDictionary<DocumentId, CancellationTokenSource>();
 
         private readonly ILogger<CSharpDiagnosticWorkerWithAnalyzers> _logger;
         private readonly ConcurrentDictionary<DocumentId, DocumentDiagnostics> _currentDiagnosticResultLookup =
@@ -131,7 +131,6 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             while (true)
             {
                 TaskCompletionSource<object?>? taskCompletionSource = null;
-                IEnumerable<DocumentId>? documentIds = null;
 
                 try
                 {
@@ -139,36 +138,17 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                         .ConfigureAwait(false);
 
                     taskCompletionSource = work.TaskCompletionSource;
-                    documentIds = work.DocumentIds;
 
-                    if (taskCompletionSource == null && documentIds != null)
-                    {
-                        documentIds = documentIds
-                            .Where(x => _workingItems.TryAdd(x, work))
-                            .ToList();
-                    }
-
-                    await AnalyzeDocuments(work.ProjectId, documentIds, work.WorkPriority, work.WorkStep)
+                    await AnalyzeDocuments(work.ProjectId, work.DocumentIds, work.WorkPriority, work.WorkStep)
                         .ConfigureAwait(false);
 
                     taskCompletionSource?.SetResult(null);
-
-                    //await Task.Delay(50)
-                    //    .ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError($"Analyzer worker failed: {ex}");
 
                     taskCompletionSource?.SetException(ex);
-                }
-                finally
-                {
-                    if (taskCompletionSource == null && documentIds != null)
-                    {
-                        foreach (var id in documentIds)
-                            _workingItems.TryRemove(id, out _);
-                    }
                 }
             }
         }
@@ -292,11 +272,34 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                             if (document == null)
                                 continue;
 
-                            compilationWithAnalyzers ??= await GetCompilationWithAnalyzers(document.Project)
-                                .ConfigureAwait(false);
+                            using var cancellationTokenSource = new CancellationTokenSource();
 
-                            await AnalyzeDocument(document, workPriority, compilationWithAnalyzers, startAtWorkStep)
-                                .ConfigureAwait(false);
+                            _workingItems.AddOrUpdate(documentId, cancellationTokenSource, (id, old) =>
+                            {
+                                old.Cancel();
+
+                                return cancellationTokenSource;
+                            });
+
+                            try
+                            {
+                                compilationWithAnalyzers ??= await GetCompilationWithAnalyzers(document.Project, cancellationTokenSource.Token)
+                                    .ConfigureAwait(false);
+
+                                await AnalyzeDocument(document, workPriority, compilationWithAnalyzers, startAtWorkStep, cancellationTokenSource.Token)
+                                    .ConfigureAwait(false);
+                            }
+                            catch (Exception ex)
+                            {
+                                if (cancellationTokenSource.IsCancellationRequested)
+                                    _logger.LogInformation(ex, $"Analysis cancelled because new work started: {ex.Message}");
+                                else
+                                    _logger.LogError(ex, ex.Message);
+                            }
+                            finally
+                            {
+                                _workingItems.TryRemove(documentId, out _);
+                            }
                         }
                     }
                 }
@@ -381,6 +384,10 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 
                         UpdateCurrentDiagnostics(document, diagnostics);
                     }
+                    else
+                    {
+                        diagnostics = Enumerable.Empty<Diagnostic>();
+                    }
 
                     if (currentWorkStep < 2)
                     {
@@ -412,7 +419,11 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             }
             catch (Exception ex)
             {
-                if (workPriority != WorkPriority.High || !perDocumentTimeout.IsCancellationRequested)
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    _logger.LogInformation($"Analysis of document {document.Name} cancelled.");
+                }
+                else if (workPriority != WorkPriority.High || !perDocumentTimeout.IsCancellationRequested)
                 {
                     _logger.LogError($"Analysis of document {document.Name} failed or cancelled by timeout: {ex.Message}");
                 }
