@@ -172,8 +172,6 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 
         private Task QueueForAnalysis(ProjectId? projectId, ImmutableArray<DocumentId>? documentIds, WorkPriority workPriority, bool awaitResults = false, int workStep = 0)
         {
-            //workPriority = workPriority == WorkPriority.Medium && _workspace.IsDocumentOpen(documentId) ? WorkPriority.High : workPriority;
-
             var channel = GetChannel(workPriority);
             var taskCompletionSource = awaitResults
                 ? new TaskCompletionSource<object?>()
@@ -198,7 +196,11 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 case WorkspaceChangeKind.DocumentReloaded:
                 case WorkspaceChangeKind.DocumentInfoChanged:
                     if (changeEvent.DocumentId != null)
-                        QueueForAnalysis(null, ImmutableArray.Create(changeEvent.DocumentId), WorkPriority.Medium);
+                    {
+                        var workPriority = _workspace.IsDocumentOpen(changeEvent.DocumentId) ? WorkPriority.High : WorkPriority.Medium;
+
+                        QueueForAnalysis(null, ImmutableArray.Create(changeEvent.DocumentId), workPriority);
+                    }
 
                     break;
                 case WorkspaceChangeKind.DocumentRemoved:
@@ -351,13 +353,16 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             {
                 perDocumentTimeout.CancelAfter(workPriority switch
                 {
-                    WorkPriority.Low => 120000,
-                    WorkPriority.Medium => 30000,
-                    _ => 1000
+                    WorkPriority.Low => _options.RoslynExtensionsOptions.DocumentAnalysisTimeoutMs * 12,
+                    WorkPriority.Medium => _options.RoslynExtensionsOptions.DocumentAnalysisTimeoutMs * 3,
+                    _ => _options.RoslynExtensionsOptions.DocumentAnalysisTimeoutMs / 10
                 });
 
                 var documentSemanticModel = await document.GetSemanticModelAsync(perDocumentTimeout.Token)
                     .ConfigureAwait(false);
+
+                // Only do full analysis in WorkPriority.High (open documents) or WorkPriority.Low (open documents when the parsing timed out)
+                var canDoFullAnalysis = _options.RoslynExtensionsOptions.AnalyzeOpenDocumentsOnly && workPriority != WorkPriority.Medium;
 
                 // Only basic syntax check is available if file is miscellanous like orphan .cs file.
                 // Those projects are on hard coded virtual project
@@ -374,7 +379,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                     UpdateCurrentDiagnostics(document, diagnostics);
 
                 }
-                else if (compilationWithAnalyzers != null && documentSemanticModel != null && workPriority != WorkPriority.Medium)
+                else if (compilationWithAnalyzers != null && documentSemanticModel != null && canDoFullAnalysis)
                 {
                     if (currentWorkStep < 1)
                     {
@@ -481,7 +486,9 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                     document.FilePath,
                     document.Project.Id,
                     document.Project.Name,
-                    diagnosticsWithAnalyzers.ToImmutableArray()
+                    diagnosticsWithAnalyzers.ToImmutableArray(),
+                    null,
+                    null
                 ),
                 (key, old) => new DocumentDiagnostics(
                     document.Id,

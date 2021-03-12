@@ -10,6 +10,7 @@ namespace OmniSharp.Options
         public bool EnableDecompilationSupport { get; set; }
         public bool EnableAnalyzersSupport { get; set; }
         public bool EnableImportCompletion { get; set; }
+        public bool AnalyzeOpenDocumentsOnly { get; set; } = true;
         public int DocumentAnalysisTimeoutMs { get; set; } = 10 * 1000;
     }
 

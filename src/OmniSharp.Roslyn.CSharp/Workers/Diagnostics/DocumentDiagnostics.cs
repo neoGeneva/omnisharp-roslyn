@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Linq;
 using Microsoft.CodeAnalysis;
 
 #nullable enable
@@ -20,11 +21,21 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             string? documentPath,
             ProjectId projectId,
             string projectName,
-            ImmutableArray<Diagnostic> diagnostics,
+            ImmutableArray<Diagnostic> baseDiagnostics,
             ImmutableArray<Diagnostic>? semanticDiagnostics,
             ImmutableArray<Diagnostic>? syntaxDiagnostics)
-            : this (documentId, documentPath, projectId, projectName, diagnostics)
+            : this (
+                  documentId,
+                  documentPath,
+                  projectId,
+                  projectName,
+                  baseDiagnostics
+                    .Concat(semanticDiagnostics ?? Enumerable.Empty<Diagnostic>())
+                    .Concat(syntaxDiagnostics ?? Enumerable.Empty<Diagnostic>())
+                    .ToImmutableArray()
+                )
         {
+            BaseDiagnostics = baseDiagnostics;
             SemanticDiagnostics = semanticDiagnostics;
             SyntaxDiagnostics = syntaxDiagnostics;
         }
@@ -34,6 +45,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
         public string ProjectName { get; }
         public string? DocumentPath { get; }
         public ImmutableArray<Diagnostic> Diagnostics { get; }
+        public ImmutableArray<Diagnostic> BaseDiagnostics { get; set; }
         public ImmutableArray<Diagnostic>? SemanticDiagnostics { get; set; }
         public ImmutableArray<Diagnostic>? SyntaxDiagnostics { get; set; }
     }
