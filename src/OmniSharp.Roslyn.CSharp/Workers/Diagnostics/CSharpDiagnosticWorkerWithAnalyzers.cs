@@ -496,8 +496,8 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                     document.Project.Id,
                     document.Project.Name,
                     diagnosticsWithAnalyzers.ToImmutableArray(),
-                    old.SemanticDiagnostics,
-                    old.SyntaxDiagnostics
+                    null,
+                    null
                 ));
 
             EmitDiagnostics(documentDiagnostics);
@@ -516,7 +516,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                         old.DocumentPath,
                         old.ProjectId,
                         old.ProjectName,
-                        old.Diagnostics,
+                        old.BaseDiagnostics,
                         semanticDiagnostics,
                         old.SyntaxDiagnostics
                     ));
@@ -544,7 +544,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                         old.DocumentPath,
                         old.ProjectId,
                         old.ProjectName,
-                        old.Diagnostics,
+                        old.BaseDiagnostics,
                         old.SemanticDiagnostics,
                         syntaxDiagnostics
                     ));
@@ -569,8 +569,6 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                     {
                         FileName = results.DocumentPath,
                         QuickFixes = results.Diagnostics
-                            .Concat(results.SyntaxDiagnostics ?? Enumerable.Empty<Diagnostic>())
-                            .Concat(results.SemanticDiagnostics ?? Enumerable.Empty<Diagnostic>())
                             .Select(x => x.ToDiagnosticLocation())
                             .ToList()
                     }
