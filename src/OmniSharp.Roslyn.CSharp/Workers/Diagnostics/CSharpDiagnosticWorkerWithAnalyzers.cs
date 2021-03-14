@@ -99,14 +99,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
         private async Task<ImmutableArray<DocumentDiagnostics>> GetDiagnosticsByDocumentIds(ImmutableArray<DocumentId> documentIds, bool waitForDocuments)
         {
             if (waitForDocuments)
-            {
-                var documentsToEnqueue = documentIds
-                    .Where(x => !_currentDiagnosticResultLookup.ContainsKey(x))
-                    .ToImmutableArray();
-
-                if (!documentsToEnqueue.IsEmpty)
-                    await QueueForAnalysis(null, documentsToEnqueue, WorkPriority.High, awaitResults: true);
-            }
+                await QueueForAnalysis(null, documentIds, WorkPriority.High, awaitResults: true);
 
             return documentIds
                 .Select(x => _currentDiagnosticResultLookup.TryGetValue(x, out var value) ? value : null!)
@@ -312,6 +305,8 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                     if (project == null)
                         return;
 
+                    _forwarder.ProjectAnalyzedInBackground(project.FilePath, ProjectDiagnosticStatus.Started);
+
                     var compilation = await project.GetCompilationAsync()
                         .ConfigureAwait(false);
 
@@ -327,6 +322,8 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                         if (diagnostics.Key != null)
                             UpdateCurrentDiagnostics(diagnostics.Key, diagnostics);
                     }
+
+                    _forwarder.ProjectAnalyzedInBackground(project.FilePath, ProjectDiagnosticStatus.Ready);
                 }
             }
             catch (Exception ex)
@@ -580,11 +577,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             {
                 foreach (var project in _workspace.CurrentSolution.Projects)
                 {
-                    _forwarder.ProjectAnalyzedInBackground(project.FilePath, ProjectDiagnosticStatus.Started);
-
                     await QueueForAnalysis(project.Id, null, WorkPriority.Medium, awaitResults: true);
-
-                    _forwarder.ProjectAnalyzedInBackground(project.FilePath, ProjectDiagnosticStatus.Ready);
                 }
             });
 
