@@ -1,6 +1,4 @@
-﻿// TODO: Try and figure out why it crashes when switch branches (and then can't restart) :(
-
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.Immutable;
@@ -355,14 +353,14 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 {
                     WorkPriority.Low => _options.RoslynExtensionsOptions.DocumentAnalysisTimeoutMs * 12,
                     WorkPriority.Medium => _options.RoslynExtensionsOptions.DocumentAnalysisTimeoutMs * 3,
-                    _ => _options.RoslynExtensionsOptions.DocumentAnalysisTimeoutMs / 10
+                    _ => _options.RoslynExtensionsOptions.DocumentAnalysisTimeoutMs
                 });
 
                 var documentSemanticModel = await document.GetSemanticModelAsync(perDocumentTimeout.Token)
                     .ConfigureAwait(false);
 
                 // Only do full analysis in WorkPriority.High (open documents) or WorkPriority.Low (open documents when the parsing timed out)
-                var canDoFullAnalysis = _options.RoslynExtensionsOptions.AnalyzeOpenDocumentsOnly && workPriority != WorkPriority.Medium;
+                var canDoFullAnalysis = !_options.RoslynExtensionsOptions.AnalyzeOpenDocumentsOnly || workPriority != WorkPriority.Medium;
 
                 // Only basic syntax check is available if file is miscellanous like orphan .cs file.
                 // Those projects are on hard coded virtual project
@@ -434,7 +432,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 }
                 else
                 {
-                    _logger.LogWarning($"Analysis of document {document.Name} timed out, sending from {workPriority} to {WorkPriority.Low} priority queue.");
+                    _logger.LogInformation($"Analysis of document {document.Name} timed out, sending from {workPriority} to {WorkPriority.Low} priority queue.");
 
                     _ = QueueForAnalysis(null, ImmutableArray.Create(document.Id), WorkPriority.Low, workStep: currentWorkStep);
                 }
