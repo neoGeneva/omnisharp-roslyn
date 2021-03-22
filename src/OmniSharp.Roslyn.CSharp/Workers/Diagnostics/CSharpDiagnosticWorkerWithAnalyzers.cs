@@ -6,7 +6,6 @@ using System.Composition;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
-using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Diagnostics;
@@ -26,7 +25,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
     {
         private const string UpdateNonExistantError = "Tried to update non-existant diagnostic.";
 
-        private readonly Channel<ChannelWork>[] _channels;
+        private readonly PrioritisedWorkQueue[] _channels;
         private readonly ConcurrentDictionary<DocumentId, CancellationTokenSource> _workingItems =
             new ConcurrentDictionary<DocumentId, CancellationTokenSource>();
 
@@ -58,7 +57,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 .ToList();
 
             _channels = workPriorities
-                .Select(x => Channel.CreateUnbounded<ChannelWork>())
+                .Select(x => new PrioritisedWorkQueue())
                 .ToArray();
 
             _forwarder = forwarder;
@@ -93,13 +92,20 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
         {
             var documentIds = GetDocumentIdsFromPaths(documentPaths);
 
-            return await GetDiagnosticsByDocumentIds(documentIds, waitForDocuments: true);
+            return await GetDiagnosticsByDocumentIds(documentIds, waitForDocuments: true)
+                .ConfigureAwait(false);
         }
 
         private async Task<ImmutableArray<DocumentDiagnostics>> GetDiagnosticsByDocumentIds(ImmutableArray<DocumentId> documentIds, bool waitForDocuments)
         {
             if (waitForDocuments)
-                await QueueForAnalysis(null, documentIds, WorkPriority.High, awaitResults: true);
+            {
+                await Task.WhenAny(
+                        Task.WhenAll(_channels.Select(x => x.WaitForDocuments(documentIds))),
+                        Task.Delay(1_000)
+                    )
+                    .ConfigureAwait(false);
+            }
 
             return documentIds
                 .Select(x => _currentDiagnosticResultLookup.TryGetValue(x, out var value) ? value : null!)
@@ -121,59 +127,65 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 
             while (true)
             {
-                TaskCompletionSource<object?>? taskCompletionSource = null;
+                PrioritisedWorkItem? work = null;
 
                 try
                 {
-                    var work = await GetNextWorkItem(channels)
+                    work = await GetNextWorkItem(channels)
                         .ConfigureAwait(false);
-
-                    taskCompletionSource = work.TaskCompletionSource;
 
                     await AnalyzeDocuments(work.ProjectId, work.DocumentIds, work.WorkPriority, work.WorkStep)
                         .ConfigureAwait(false);
-
-                    taskCompletionSource?.SetResult(null);
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError($"Analyzer worker failed: {ex}");
-
-                    taskCompletionSource?.SetException(ex);
+                }
+                finally
+                {
+                    if (work != null)
+                        CompleteWorkItem(channels, work);
                 }
             }
         }
 
-        private async ValueTask<ChannelWork> GetNextWorkItem(Channel<ChannelWork>[] channels)
+        private async ValueTask<PrioritisedWorkItem> GetNextWorkItem(PrioritisedWorkQueue[] channels)
         {
             while (true)
             {
                 foreach (var channel in channels)
                 {
-                    if (channel.Reader.TryRead(out var workItem))
+                    if (channel.TryRead(out var workItem))
                         return workItem;
                 }
 
-                var tasks = channels.Select(x => x.Reader.WaitToReadAsync().AsTask()).ToArray();
+                var tasks = channels.Select(x => x.WaitToRead()).ToArray();
 
                 await Task.WhenAny(tasks)
                     .ConfigureAwait(false);
             }
         }
 
+
+        private void CompleteWorkItem(PrioritisedWorkQueue[] channels, PrioritisedWorkItem workItem)
+        {
+            foreach (var channel in channels)
+                channel.CompleteWorkItem(workItem);
+        }
+
         private Task QueueForAnalysis(ProjectId? projectId, ImmutableArray<DocumentId>? documentIds, WorkPriority workPriority, bool awaitResults = false, int workStep = 0)
         {
             var channel = GetChannel(workPriority);
             var taskCompletionSource = awaitResults
-                ? new TaskCompletionSource<object?>()
+                ? new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously)
                 : null;
 
-            channel.Writer.TryWrite(new ChannelWork(workPriority, projectId, documentIds, taskCompletionSource, workStep));
+            channel.Enqueue(new PrioritisedWorkItem(workPriority, projectId, documentIds, taskCompletionSource, workStep));
 
             return taskCompletionSource?.Task ?? Task.CompletedTask;
         }
 
-        private Channel<ChannelWork> GetChannel(WorkPriority workPriority)
+        private PrioritisedWorkQueue GetChannel(WorkPriority workPriority)
         {
             return _channels[(int)workPriority];
         }
@@ -220,7 +232,6 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 case WorkspaceChangeKind.SolutionReloaded:
                     QueueDocumentsForDiagnostics();
                     break;
-
             }
         }
 
@@ -228,20 +239,28 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
         {
             var compilationWithAnalyzers = await GetCompilationWithAnalyzers(document.Project, cancellationToken);
 
-            return await AnalyzeDocument(document, WorkPriority.High, compilationWithAnalyzers, cancellationToken: cancellationToken);
+            return await AnalyzeDocument(document, WorkPriority.High, compilationWithAnalyzers, cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
         }
 
         public async Task<IEnumerable<Diagnostic>> AnalyzeProjectsAsync(Project project, CancellationToken cancellationToken)
         {
             var diagnostics = new List<Diagnostic>();
 
-            var compilationWithAnalyzers = await GetCompilationWithAnalyzers(project, cancellationToken);
+            var compilationWithAnalyzers = await GetCompilationWithAnalyzers(project, cancellationToken)
+                .ConfigureAwait(false);
 
             if (compilationWithAnalyzers != null)
-                return await compilationWithAnalyzers.GetAllDiagnosticsAsync(cancellationToken);
+            {
+                return await compilationWithAnalyzers.GetAllDiagnosticsAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
 
             foreach (var document in project.Documents)
-                diagnostics.AddRange(await AnalyzeDocument(document, WorkPriority.High, compilationWithAnalyzers, cancellationToken: cancellationToken));
+            {
+                diagnostics.AddRange(await AnalyzeDocument(document, WorkPriority.High, compilationWithAnalyzers, cancellationToken: cancellationToken)
+                    .ConfigureAwait(false));
+            }
 
             return diagnostics;
         }
@@ -250,8 +269,13 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
         {
             try
             {
-                if (documents != null)
+                if (documents != null || projectId != null && !_options.RoslynExtensionsOptions.AnalyzeOpenDocumentsOnly)
                 {
+                    documents ??= _workspace.CurrentSolution.GetProject(projectId)?.DocumentIds;
+
+                    if (documents == null)
+                        return;
+
                     var documentsByProject = documents.GroupBy(x => x.ProjectId);
 
                     foreach (var project in documentsByProject)
@@ -348,8 +372,8 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             {
                 perDocumentTimeout.CancelAfter(workPriority switch
                 {
-                    WorkPriority.Low => _options.RoslynExtensionsOptions.DocumentAnalysisTimeoutMs * 12,
-                    WorkPriority.Medium => _options.RoslynExtensionsOptions.DocumentAnalysisTimeoutMs * 3,
+                    WorkPriority.Low => 120_000,
+                    WorkPriority.Medium => 30_000,
                     _ => _options.RoslynExtensionsOptions.DocumentAnalysisTimeoutMs
                 });
 
@@ -382,7 +406,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 
                         currentWorkStep = 1;
 
-                        UpdateCurrentDiagnostics(document, diagnostics);
+                        UpdateCurrentDiagnostics(document, diagnostics, keepAdditionalDiagnostics: true);
                     }
                     else
                     {
@@ -473,7 +497,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 $"\n            exception: {ex.Message}");
         }
 
-        private void UpdateCurrentDiagnostics(Document document, IEnumerable<Diagnostic> diagnosticsWithAnalyzers)
+        private void UpdateCurrentDiagnostics(Document document, IEnumerable<Diagnostic> diagnosticsWithAnalyzers, bool keepAdditionalDiagnostics = false)
         {
             var documentDiagnostics = _currentDiagnosticResultLookup.AddOrUpdate(document.Id,
                 (key) => new DocumentDiagnostics(
@@ -491,8 +515,8 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                     document.Project.Id,
                     document.Project.Name,
                     diagnosticsWithAnalyzers.ToImmutableArray(),
-                    null,
-                    null
+                    keepAdditionalDiagnostics ? old.SemanticDiagnostics : null,
+                    keepAdditionalDiagnostics ? old.SyntaxDiagnostics : null
                 ));
 
             EmitDiagnostics(documentDiagnostics);
@@ -616,9 +640,9 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             Low = 2,
         }
 
-        private class ChannelWork
+        private class PrioritisedWorkItem
         {
-            public ChannelWork(WorkPriority workPriority,
+            public PrioritisedWorkItem(WorkPriority workPriority,
                 ProjectId? projectId,
                 ImmutableArray<DocumentId>? documentIds,
                 TaskCompletionSource<object?>? taskCompletionSource,
@@ -634,8 +658,137 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             public WorkPriority WorkPriority { get; }
             public ProjectId? ProjectId { get; }
             public ImmutableArray<DocumentId>? DocumentIds { get; }
-            public TaskCompletionSource<object?>? TaskCompletionSource { get; }
+            public TaskCompletionSource<object?>? TaskCompletionSource { get; set; }
             public int WorkStep { get; }
+        }
+
+        private class PrioritisedWorkQueue
+        {
+            private readonly Queue<PrioritisedWorkItem> _queue;
+            private readonly List<PrioritisedWorkItem> _currentWorkItems;
+            private readonly object _lock;
+            private TaskCompletionSource<object?> _wait;
+
+            public PrioritisedWorkQueue()
+            {
+                _queue = new Queue<PrioritisedWorkItem>();
+                _currentWorkItems = new List<PrioritisedWorkItem>();
+                _lock = new object();
+                _wait = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            }
+
+            public void Enqueue(PrioritisedWorkItem workItem)
+            {
+                lock (_lock)
+                {
+                    if (workItem.ProjectId != null && _queue.All(x => x.ProjectId != workItem.ProjectId))
+                    {
+                        _queue.Enqueue(workItem);
+                    }
+                    else if (workItem.DocumentIds != null)
+                    {
+                        var collectionDocumentIds = _queue
+                            .Where(x => x.DocumentIds != null)
+                            .SelectMany(x => x.DocumentIds!.Value);
+
+                        var remainingItems = workItem.DocumentIds
+                            .Except(collectionDocumentIds)
+                            .ToImmutableArray();
+
+                        if (remainingItems.IsEmpty)
+                            return;
+
+                        if (remainingItems.Length == workItem.DocumentIds.Value.Length)
+                        {
+                            _queue.Enqueue(workItem);
+                        }
+                        else
+                        {
+                            _queue.Enqueue(new PrioritisedWorkItem(
+                                workItem.WorkPriority,
+                                null,
+                                remainingItems,
+                                workItem.TaskCompletionSource,
+                                workItem.WorkStep
+                            ));
+                        }
+                    }
+                }
+
+                _wait.TrySetResult(null);
+            }
+
+            public bool TryRead(out PrioritisedWorkItem workItem)
+            {
+                lock (_lock)
+                {
+                    if (_queue.Count > 0)
+                    {
+                        workItem = _queue.Dequeue();
+
+                        _currentWorkItems.Add(workItem);
+
+                        return true;
+                    }
+
+                    workItem = null!;
+
+                    return false;
+                }
+            }
+
+            public Task WaitToRead()
+            {
+                lock (_lock)
+                {
+                    if (_queue.Count > 0)
+                        return Task.CompletedTask;
+
+                    if (_wait.Task.IsCompleted)
+                        _wait = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+                    return _wait.Task;
+                }
+            }
+
+            internal void CompleteWorkItem(PrioritisedWorkItem workItem)
+            {
+                var isRemoved = false;
+
+                lock (_lock)
+                {
+                    isRemoved = _currentWorkItems.Remove(workItem);
+                }
+
+                if (isRemoved)
+                    workItem.TaskCompletionSource?.TrySetResult(null);
+            }
+
+            internal Task WaitForDocuments(ImmutableArray<DocumentId> documentIds)
+            {
+                var _pendingTasks = new List<Task>();
+
+                lock (_lock)
+                {
+                    foreach (var item in _queue.Concat(_currentWorkItems))
+                    {
+                        if (item.DocumentIds != null
+                            && documentIds.Intersect(item.DocumentIds).Any()
+                            || item.ProjectId != null
+                            && documentIds.Any(x => x.ProjectId == item.ProjectId))
+                        {
+                            var tcs = item.TaskCompletionSource ??= new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+                            _pendingTasks.Add(tcs.Task);
+                        }
+                    }
+
+                    if (_pendingTasks.Count == 0)
+                        return Task.CompletedTask;
+
+                    return Task.WhenAll(_pendingTasks);
+                }
+            }
         }
     }
 }
