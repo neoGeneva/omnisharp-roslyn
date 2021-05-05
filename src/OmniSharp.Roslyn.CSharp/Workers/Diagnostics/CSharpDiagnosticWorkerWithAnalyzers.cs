@@ -180,11 +180,26 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 ? new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously)
                 : null;
 
+            if (documentIds != null)
+            {
+                foreach (var documentId in documentIds)
+                {
+                    foreach (var otherChannel in _channels)
+                    {
+                        if (channel != otherChannel)
+                            otherChannel.Remove(documentId);
+                    }
+
+                    if (_workingItems.TryRemove(documentId, out var cts))
+                        cts.Cancel();
+                }
+            }
+
             channel.Enqueue(new PrioritisedWorkItem(workPriority, projectId, documentIds, taskCompletionSource, workStep));
 
             return taskCompletionSource?.Task ?? Task.CompletedTask;
         }
-
+        
         private PrioritisedWorkQueue GetChannel(WorkPriority workPriority)
         {
             return _channels[(int)workPriority];
@@ -484,8 +499,8 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             return compilation.WithAnalyzers(allAnalyzers, new CompilationWithAnalyzersOptions(
                 workspaceAnalyzerOptions,
                 onAnalyzerException: OnAnalyzerException,
-                concurrentAnalysis: false,
-                logAnalyzerExecutionTime: false,
+                concurrentAnalysis: true,
+                logAnalyzerExecutionTime: true,
                 reportSuppressedDiagnostics: false));
         }
 
@@ -716,6 +731,24 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 }
 
                 _wait.TrySetResult(null);
+            }
+
+            public void Remove(DocumentId documentId)
+            {
+                lock (_lock)
+                {
+                    var newQueue = _queue
+                        .Where(x => x.DocumentIds == null || !x.DocumentIds.Contains(documentId))
+                        .ToList();
+
+                    if (newQueue.Count == _queue.Count)
+                        return;
+
+                    _queue.Clear();
+
+                    foreach (var item in newQueue)
+                        newQueue.Add(item);
+                }
             }
 
             public bool TryRead(out PrioritisedWorkItem workItem)
