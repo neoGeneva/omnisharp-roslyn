@@ -385,12 +385,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 
             try
             {
-                perDocumentTimeout.CancelAfter(workPriority switch
-                {
-                    WorkPriority.Low => 120_000,
-                    WorkPriority.Medium => 30_000,
-                    _ => _options.RoslynExtensionsOptions.DocumentAnalysisTimeoutMs
-                });
+                perDocumentTimeout.CancelAfter(_options.RoslynExtensionsOptions.DocumentAnalysisTimeoutMs);
 
                 var documentSemanticModel = await document.GetSemanticModelAsync(perDocumentTimeout.Token)
                     .ConfigureAwait(false);
