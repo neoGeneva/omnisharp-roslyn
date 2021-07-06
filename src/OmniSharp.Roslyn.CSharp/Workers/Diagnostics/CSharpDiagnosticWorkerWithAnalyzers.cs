@@ -199,7 +199,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 
             return taskCompletionSource?.Task ?? Task.CompletedTask;
         }
-        
+
         private PrioritisedWorkQueue GetChannel(WorkPriority workPriority)
         {
             return _channels[(int)workPriority];
