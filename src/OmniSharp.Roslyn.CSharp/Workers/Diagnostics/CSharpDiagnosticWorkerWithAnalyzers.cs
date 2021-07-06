@@ -412,7 +412,8 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                 {
                     if (currentWorkStep < 1)
                     {
-                        diagnostics = documentSemanticModel.GetDiagnostics(null, perDocumentTimeout.Token);
+                        diagnostics = documentSemanticModel.GetDiagnostics(null, perDocumentTimeout.Token)
+                            .Where(d => !d.IsSuppressed);
 
                         currentWorkStep = 1;
 
@@ -425,9 +426,10 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
 
                     if (currentWorkStep < 2)
                     {
-                        var semanticDiagnostics = await compilationWithAnalyzers
+                        var semanticDiagnostics = (await compilationWithAnalyzers
                             .GetAnalyzerSemanticDiagnosticsAsync(documentSemanticModel, filterSpan: null, perDocumentTimeout.Token)
-                            .ConfigureAwait(false);
+                            .ConfigureAwait(false))
+                            .Where(d => !d.IsSuppressed);
 
                         diagnostics = diagnostics.Concat(semanticDiagnostics);
 
@@ -436,9 +438,10 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                         UpdateSemanticDiagnostics(document.Id, semanticDiagnostics);
                     }
 
-                    var syntaxDiagnostics = await compilationWithAnalyzers
+                    var syntaxDiagnostics = (await compilationWithAnalyzers
                         .GetAnalyzerSyntaxDiagnosticsAsync(documentSemanticModel.SyntaxTree, perDocumentTimeout.Token)
-                        .ConfigureAwait(false);
+                        .ConfigureAwait(false))
+                        .Where(d => !d.IsSuppressed);
 
                     diagnostics = diagnostics.Concat(syntaxDiagnostics);
 
@@ -532,7 +535,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             EmitDiagnostics(documentDiagnostics);
         }
 
-        private void UpdateSemanticDiagnostics(DocumentId documentId, ImmutableArray<Diagnostic> semanticDiagnostics)
+        private void UpdateSemanticDiagnostics(DocumentId documentId, IEnumerable<Diagnostic> semanticDiagnostics)
         {
             DocumentDiagnostics documentDiagnostics;
 
@@ -546,7 +549,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                         old.ProjectId,
                         old.ProjectName,
                         old.BaseDiagnostics,
-                        semanticDiagnostics,
+                        semanticDiagnostics.ToImmutableArray(),
                         old.SyntaxDiagnostics
                     ));
             }
@@ -560,7 +563,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
             EmitDiagnostics(documentDiagnostics);
         }
 
-        private void UpdateSyntaxDiagnostics(DocumentId documentId, ImmutableArray<Diagnostic> syntaxDiagnostics)
+        private void UpdateSyntaxDiagnostics(DocumentId documentId, IEnumerable<Diagnostic> syntaxDiagnostics)
         {
             DocumentDiagnostics documentDiagnostics;
 
@@ -575,7 +578,7 @@ namespace OmniSharp.Roslyn.CSharp.Services.Diagnostics
                         old.ProjectName,
                         old.BaseDiagnostics,
                         old.SemanticDiagnostics,
-                        syntaxDiagnostics
+                        syntaxDiagnostics.ToImmutableArray()
                     ));
             }
             catch (InvalidOperationException ex) when (ex.Message == UpdateNonExistantError)
